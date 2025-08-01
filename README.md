@@ -267,22 +267,10 @@ Common errors and solutions:
 
 ## Testing Your Dataset
 
-Use the provided test script to validate your dataset structure:
+Test directly in Python:
 
 ```python
-python test_your_dataset.py
-```
-
-This will:
-- Check directory structure
-- Detect camera views from filenames
-- Test the importer with a small sample
-- Provide usage suggestions
-
-Or test directly in Python:
-
-```python
-from lerobot_extracted_importer import create_lerobot_extracted_dataset
+from lerobot_importer import create_lerobot_extracted_dataset
 
 # Quick test with minimal data
 test_dataset = create_lerobot_extracted_dataset(
@@ -303,7 +291,7 @@ test_dataset.delete()  # Clean up
 ### Method 2: Direct Importer Usage
 
 ```python
-from lerobot_extracted_importer import LeRobotDatasetImporter
+from lerobot_importer import LeRobotDatasetImporter
 
 # Create importer directly
 importer = LeRobotDatasetImporter(
