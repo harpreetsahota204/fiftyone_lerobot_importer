@@ -82,12 +82,12 @@ dataset_root/
 
 ```python
 import fiftyone as fo
-from lerobot_importer import LeRobotDatasetImporter, LeRobotDatasetType, create_lerobot_extracted_dataset
+from lerobot_importer import LeRobotDatasetImporter, LeRobotDatasetType, create_lerobot_dataset
 
 dataset_dir = "aloha_pen_uncap_diverse"
 
 # Method 1: Using the helper function (recommended)
-dataset = create_lerobot_extracted_dataset(
+dataset = create_lerobot_dataset(
     dataset_dir=dataset_dir,
     name="aloha_pen_uncap",
     # REQUIRED: Specify the camera views you want to load
@@ -128,7 +128,7 @@ print(f"Camera views: {dataset.group_slices}")
 
 ```python
 # Using dataset root directory
-dataset = create_lerobot_extracted_dataset(
+dataset = create_lerobot_dataset(
     dataset_dir="/path/to/dataset",
     name="my_dataset",
     camera_views=["low", "high", "right_wrist", "left_wrist"]
@@ -139,7 +139,7 @@ dataset = create_lerobot_extracted_dataset(
 
 ```python
 # Using explicit paths
-dataset = create_lerobot_extracted_dataset(
+dataset = create_lerobot_dataset(
     dataset_dir=None,
     data_path="/path/to/extracted_data",
     labels_path="/path/to/meta",
@@ -151,9 +151,9 @@ dataset = create_lerobot_extracted_dataset(
 ### Advanced Usage - Group by episodes for better navigation
 
 ```python
-from lerobot_extracted_importer import create_lerobot_extracted_dataset
+from lerobot_importer import create_lerobot_dataset
 
-dataset = create_lerobot_extracted_dataset(
+dataset = create_lerobot_dataset(
     dataset_dir="/path/to/dataset",
     name="my_dataset",
     camera_views=["low", "high"],
@@ -171,7 +171,7 @@ dataset.save_view("episodes", view)
 
 ```python
 # Single camera view
-dataset = create_lerobot_extracted_dataset(
+dataset = create_lerobot_dataset(
     dataset_dir="/path/to/dataset",
     name="single_camera",
     camera_views=["high"],  # Only high camera
@@ -179,7 +179,7 @@ dataset = create_lerobot_extracted_dataset(
 )
 
 # Specific episodes
-dataset = create_lerobot_extracted_dataset(
+dataset = create_lerobot_dataset(
     dataset_dir="/path/to/dataset",
     name="specific_episodes",
     camera_views=["low", "high"],
@@ -187,7 +187,7 @@ dataset = create_lerobot_extracted_dataset(
 )
 
 # No metadata (faster loading)
-dataset = create_lerobot_extracted_dataset(
+dataset = create_lerobot_dataset(
     dataset_dir="/path/to/dataset",
     name="no_metadata",
     camera_views=["high", "right_wrist"],
@@ -270,10 +270,10 @@ Common errors and solutions:
 Test directly in Python:
 
 ```python
-from lerobot_importer import create_lerobot_extracted_dataset
+from lerobot_importer import create_lerobot_dataset
 
 # Quick test with minimal data
-test_dataset = create_lerobot_extracted_dataset(
+test_dataset = create_lerobot_dataset(
     dataset_dir="/path/to/your/dataset",
     name="test_dataset",
     camera_views=["low", "high"],  # Adjust to your cameras

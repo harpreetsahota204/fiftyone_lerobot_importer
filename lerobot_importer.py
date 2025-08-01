@@ -569,7 +569,7 @@ class LeRobotDatasetType(fo.Dataset):
 
 
 # Helper function to create LeRobot extracted grouped dataset
-def create_lerobot_extracted_dataset(
+def create_lerobot_dataset(
     dataset_dir: str = None,
     data_path: str = None,
     labels_path: str = None,
