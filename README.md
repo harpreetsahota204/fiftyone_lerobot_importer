@@ -89,6 +89,7 @@ dataset_dir = "aloha_pen_uncap_diverse"
 # Method 1: Using the helper function (recommended)
 dataset = create_lerobot_dataset(
     dataset_dir=dataset_dir,
+    dataset_type=LeRobotDatasetType(),
     name="aloha_pen_uncap",
     # REQUIRED: Specify the camera views you want to load
     camera_views=["low", "high", "right_wrist", "left_wrist"],
@@ -141,6 +142,7 @@ dataset = create_lerobot_dataset(
 # Using explicit paths
 dataset = create_lerobot_dataset(
     dataset_dir=None,
+    dataset_type=LeRobotDatasetType(),
     data_path="/path/to/extracted_data",
     labels_path="/path/to/meta",
     name="my_dataset",
@@ -155,6 +157,7 @@ from lerobot_importer import create_lerobot_dataset
 
 dataset = create_lerobot_dataset(
     dataset_dir="/path/to/dataset",
+    dataset_type=LeRobotDatasetType(),
     name="my_dataset",
     camera_views=["low", "high"],
     episode_ids=[0, 1, 2, 3, 4],  # First 5 episodes
@@ -173,6 +176,7 @@ dataset.save_view("episodes", view)
 # Single camera view
 dataset = create_lerobot_dataset(
     dataset_dir="/path/to/dataset",
+    dataset_type=LeRobotDatasetType(),
     name="single_camera",
     camera_views=["high"],  # Only high camera
     max_samples=50
@@ -181,6 +185,7 @@ dataset = create_lerobot_dataset(
 # Specific episodes
 dataset = create_lerobot_dataset(
     dataset_dir="/path/to/dataset",
+    dataset_type=LeRobotDatasetType(),
     name="specific_episodes",
     camera_views=["low", "high"],
     episode_ids=[100, 101, 102],  # Only these episodes
@@ -189,6 +194,7 @@ dataset = create_lerobot_dataset(
 # No metadata (faster loading)
 dataset = create_lerobot_dataset(
     dataset_dir="/path/to/dataset",
+    dataset_type=LeRobotDatasetType(),
     name="no_metadata",
     camera_views=["high", "right_wrist"],
     include_metadata=False  # Skip JSON loading
@@ -275,6 +281,7 @@ from lerobot_importer import create_lerobot_dataset
 # Quick test with minimal data
 test_dataset = create_lerobot_dataset(
     dataset_dir="/path/to/your/dataset",
+    dataset_type=LeRobotDatasetType(),
     name="test_dataset",
     camera_views=["low", "high"],  # Adjust to your cameras
     episode_ids=[0],  # Just first episode
@@ -296,6 +303,7 @@ from lerobot_importer import LeRobotDatasetImporter
 # Create importer directly
 importer = LeRobotDatasetImporter(
     dataset_dir="/path/to/dataset",
+    dataset_type=LeRobotDatasetType(),
     camera_views=["low", "high", "right_wrist", "left_wrist"],
     include_metadata=True
 )
