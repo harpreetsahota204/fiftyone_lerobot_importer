@@ -6,9 +6,11 @@ A FiftyOne importer for [LeRobot v3.0](https://huggingface.co/docs/lerobot/lerob
 
 - **Native v3.0 Support**: Directly imports LeRobot v3.0 sharded datasets (no extraction needed)
 - **Grouped Video Samples**: Each episode is a group with camera views as slices
-- **Frame-Level Data**: Observation states and actions stored in FiftyOne's native video frames
+- **Dynamic Schema**: All frame fields automatically parsed from `info.json` features — no hardcoded field names
+- **Field Filtering**: Include/exclude fields with glob patterns (e.g., `exclude_fields=["*.is_fresh"]`)
+- **Round-Trip Metadata**: Field mappings, semantic names, and normalization stats preserved for export back to LeRobot format
 - **Browser Compatible**: All videos re-encoded to H.264/yuv420p for FiftyOne App playback
-- **Auto-Detection**: Automatically detects camera views from dataset features
+- **Auto-Detection**: Automatically detects camera views from dataset features, including multi-segment names
 
 ## Installation
 
@@ -107,27 +109,50 @@ print(f"Imported {len(dataset)} samples")
 print(f"Camera views: {dataset.group_slices}")
 ```
 
-### Import with Filtering
+### Import with Episode Filtering
 
 ```python
 # Import specific episodes
-importer = LeRobotDatasetImporter(
+dataset = import_lerobot_dataset(
     dataset_dir="/path/to/dataset",
     episode_ids=[0, 1, 2, 3, 4],  # First 5 episodes
     max_samples=10,               # Or limit total episodes
 )
 
 # Filter by task
-importer = LeRobotDatasetImporter(
+dataset = import_lerobot_dataset(
     dataset_dir="/path/to/dataset",
     task_ids=[0],  # Only episodes with task_index=0
+)
+```
+
+### Import with Field Filtering
+
+```python
+# Only import observation and action fields (skip freshness flags, etc.)
+dataset = import_lerobot_dataset(
+    dataset_dir="/path/to/dataset",
+    include_fields=["observation.*", "action.*", "timestamp"],
+)
+
+# Import everything except freshness flags
+dataset = import_lerobot_dataset(
+    dataset_dir="/path/to/dataset",
+    exclude_fields=["*.is_fresh"],
+)
+
+# Combine: only observation/action fields, minus freshness
+dataset = import_lerobot_dataset(
+    dataset_dir="/path/to/dataset",
+    include_fields=["observation.*", "action.*", "timestamp"],
+    exclude_fields=["*.is_fresh"],
 )
 ```
 
 ### Skip Frame-Level Data (Faster Import)
 
 ```python
-importer = LeRobotDatasetImporter(
+dataset = import_lerobot_dataset(
     dataset_dir="/path/to/dataset",
     include_frame_data=False,  # Skip loading states/actions per frame
 )
@@ -153,6 +178,8 @@ importer = LeRobotDatasetImporter(
 | `task_ids` | List[int] | None | Filter by task IDs (None = all) |
 | `clips_dir` | str/Path | `{dataset_dir}/episode_clips` | Directory for extracted clips |
 | `include_frame_data` | bool | True | Load frame-level states/actions |
+| `include_fields` | List[str] | None | Glob patterns for fields to include (None = all) |
+| `exclude_fields` | List[str] | None | Glob patterns for fields to exclude (None = none) |
 | `max_samples` | int | None | Maximum episodes to import |
 | `shuffle` | bool | False | Shuffle episode order |
 | `seed` | int | None | Random seed for shuffling |
@@ -178,14 +205,23 @@ high_cam_view = dataset.select_group_slices("cam_high")
 
 ### Access Frame-Level Data
 
+Frame fields are dynamically imported from `info.json` features. The LeRobot dot-notation
+names are flattened with underscores (e.g., `observation.state` becomes `observation_state`).
+
 ```python
 sample = dataset.first()
 
 # Access frames (1-indexed in FiftyOne)
 frame_1 = sample.frames[1]
-print(frame_1.observation_state)  # Robot joint states
-print(frame_1.action)             # Robot actions
-print(frame_1.timestamp)          # Frame timestamp
+print(frame_1.observation_state)  # list: Robot joint states
+print(frame_1.action)             # list: Robot actions (or action_absolute, action_relative, etc.)
+print(frame_1.timestamp)          # float: Frame timestamp
+
+# Complex datasets may have many more fields, e.g.:
+# frame_1.observation_wrist_wrench       # list: Force/torque sensor
+# frame_1.observation_end_effector_pose_absolute  # list: 6DOF pose
+# frame_1.action_arm                     # list: Arm joint subset
+# frame_1.next_done                      # bool: Episode boundary flag
 
 # Get all frame data
 for frame_num, frame in sample.frames.items():
@@ -223,29 +259,62 @@ Each video sample contains:
 sample = dataset.first()
 
 # Episode-level fields
-sample.episode_index    # int: Episode number
-sample.camera_view      # str: Camera name (e.g., "cam_high")
-sample.length           # int: Number of frames in episode
-sample.fps              # int: Frames per second
-sample.task_index       # int: Task ID
-sample.task             # str: Task description
-sample.group            # Group: Links samples from same episode
+sample.episode_index       # int: Episode number
+sample.camera_view         # str: Camera name (e.g., "hand", "top")
+sample.task_index          # int: Task ID
+sample.task                # str: Task description
+sample.dataset_from_index  # int: Start row in source parquet
+sample.dataset_to_index    # int: End row in source parquet
+sample.group               # Group: Links samples from same episode
 
-# Frame-level fields (accessed via sample.frames[frame_num])
-sample.frames[1].observation_state  # list: Robot joint states
-sample.frames[1].action             # list: Robot actions
+# Frame-level fields are dynamic — determined by info.json features.
+# Every non-video feature is imported with dots replaced by underscores.
+# Scalar fields (shape [1]) become Python primitives (float, int, bool).
+# Array fields (shape [N]) become Python lists.
+sample.frames[1].observation_state  # list[float]: Robot joint states
+sample.frames[1].action             # list[float]: Robot actions
 sample.frames[1].timestamp          # float: Timestamp in seconds
-sample.frames[1].global_index       # int: Global frame index
+```
+
+### Dataset Info (Round-Trip Metadata)
+
+All metadata needed to export back to LeRobot format is stored in `dataset.info`:
+
+```python
+dataset.info["lerobot_field_map"]   # {"observation_state": "observation.state", ...}
+dataset.info["field_names"]         # {"observation_state": ["arm_lift_joint", ...]}
+dataset.info["video_feature_map"]   # {"hand": "observation.image.hand", ...}
+dataset.info["features"]            # Full info.json features dict
+dataset.info["stats"]               # Normalization statistics (for ML training)
+dataset.info["tasks"]               # Task vocabulary mapping
+dataset.info["fps"]                 # Frames per second
+dataset.info["robot_type"]          # Robot type string
 ```
 
 ## How It Works
 
 1. **Validates** the dataset is v3.0 format (checks `meta/info.json`)
 2. **Loads metadata** from chunked Parquet files in `meta/episodes/` and `meta/tasks/`
-3. **Extracts episode clips** from sharded MP4 videos using timestamps from episode metadata
-4. **Re-encodes** all clips to H.264/yuv420p for browser compatibility
-5. **Loads frame data** from sharded Parquet files in `data/`
-6. **Creates grouped samples** where each episode is a group with camera slices
+3. **Builds frame field schema** dynamically from `info.json` features, applying include/exclude filters
+4. **Extracts episode clips** from sharded MP4 videos using timestamps from episode metadata
+5. **Re-encodes** clips to H.264/yuv420p for browser compatibility (stream-copies when source is already H.264)
+6. **Loads frame data** from sharded Parquet files in `data/`, converting types per the schema
+7. **Creates grouped samples** where each episode is a group with camera slices
+
+### Dynamic Schema
+
+The importer reads `info.json` features and maps each field type to FiftyOne:
+
+| LeRobot dtype | Shape | FiftyOne type | Python type |
+|---------------|-------|---------------|-------------|
+| `video` | any | Skip (group slices) | — |
+| `float32` / `float64` | `[1]` | `FloatField` | `float` |
+| `float32` / `float64` | `[N]` | `ListField` | `list[float]` |
+| `int64` | `[1]` | `IntField` | `int` |
+| `bool` | `[1]` | `BooleanField` | `bool` |
+| `bool` / `int64` | `[N]` | `ListField` | `list` |
+
+Field names are converted from dot-notation to underscores: `observation.state` becomes `observation_state`.
 
 ## Requirements
 
