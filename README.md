@@ -63,15 +63,16 @@ dataset_path = snapshot_download(
 ### Import into FiftyOne
 
 ```python
-from lerobot_importer import import_lerobot_dataset
+import fiftyone as fo
+from lerobot_importer import LeRobotDataset
 
-dataset = import_lerobot_dataset(
+dataset = fo.Dataset.from_dir(
     dataset_dir="my_dataset",
+    dataset_type=LeRobotDataset,
     name="my_robot_data",
 )
 
 # Launch FiftyOne App
-import fiftyone as fo
 session = fo.launch_app(dataset)
 ```
 
@@ -81,15 +82,19 @@ session = fo.launch_app(dataset)
 
 ```python
 # Import specific episodes
-dataset = import_lerobot_dataset(
+dataset = fo.Dataset.from_dir(
     dataset_dir="/path/to/dataset",
+    dataset_type=LeRobotDataset,
+    name="my_dataset",
     episode_ids=[0, 1, 2, 3, 4],
     max_samples=10,
 )
 
 # Filter by task
-dataset = import_lerobot_dataset(
+dataset = fo.Dataset.from_dir(
     dataset_dir="/path/to/dataset",
+    dataset_type=LeRobotDataset,
+    name="my_dataset",
     task_ids=[0],
 )
 ```
@@ -98,20 +103,26 @@ dataset = import_lerobot_dataset(
 
 ```python
 # Only import observation and action fields
-dataset = import_lerobot_dataset(
+dataset = fo.Dataset.from_dir(
     dataset_dir="/path/to/dataset",
+    dataset_type=LeRobotDataset,
+    name="my_dataset",
     include_fields=["observation.*", "action.*", "timestamp"],
 )
 
 # Import everything except freshness flags
-dataset = import_lerobot_dataset(
+dataset = fo.Dataset.from_dir(
     dataset_dir="/path/to/dataset",
+    dataset_type=LeRobotDataset,
+    name="my_dataset",
     exclude_fields=["*.is_fresh"],
 )
 
 # Combine both
-dataset = import_lerobot_dataset(
+dataset = fo.Dataset.from_dir(
     dataset_dir="/path/to/dataset",
+    dataset_type=LeRobotDataset,
+    name="my_dataset",
     include_fields=["observation.*", "action.*", "timestamp"],
     exclude_fields=["*.is_fresh"],
 )
@@ -120,23 +131,11 @@ dataset = import_lerobot_dataset(
 ### Skip Frame-Level Data (Faster Import)
 
 ```python
-dataset = import_lerobot_dataset(
-    dataset_dir="/path/to/dataset",
-    include_frame_data=False,
-)
-```
-
-### Using `fo.Dataset.from_dir`
-
-```python
-import fiftyone as fo
-from lerobot_importer import LeRobotDataset
-
 dataset = fo.Dataset.from_dir(
     dataset_dir="/path/to/dataset",
     dataset_type=LeRobotDataset,
     name="my_dataset",
-    max_samples=10,
+    include_frame_data=False,
 )
 ```
 
