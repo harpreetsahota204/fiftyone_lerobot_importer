@@ -15,13 +15,14 @@ import fnmatch
 import json
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Union, Iterator, Tuple
+from typing import Dict, List, Optional, Any, Union, Iterator
 
-import pandas as pd
-import numpy as np
+import math
+
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 import fiftyone as fo
-import fiftyone.core.fields as fof
 import fiftyone.core.groups as fog
 import fiftyone.core.metadata as fom
 import fiftyone.core.utils as focu
@@ -114,11 +115,11 @@ class LeRobotDatasetImporter(GroupDatasetImporter):
         
         # Internal state
         self._dataset_info: Optional[Dict] = None
-        self._episodes_df: Optional[pd.DataFrame] = None
-        self._tasks_df: Optional[pd.DataFrame] = None
+        self._episodes: Optional[List[Dict]] = None  # list of episode dicts
         self._stats: Dict = {}  # stats.json contents
         self._task_mapping: Dict[str, int] = {}  # task_string -> task_index
-        self._data_df_cache: Dict[tuple, pd.DataFrame] = {}
+        self._data_table_cache: Dict[tuple, Any] = {}  # PyArrow table cache
+        self._columns_to_read: Optional[List[str]] = None  # Parquet columns needed
         self._video_splitter: Optional[VideoSplitter] = None
         self._episodes_to_import: Optional[List[Dict]] = None
         self._fps: int = 30
@@ -130,8 +131,6 @@ class LeRobotDatasetImporter(GroupDatasetImporter):
         # Frame field schema (built from info.json features)
         # fo_name -> {"lerobot_name": str, "dtype": str, "shape": list, "is_scalar": bool}
         self._frame_fields: Dict[str, Dict] = {}
-        # fo_name -> lerobot_name (for export round-trip)
-        self._field_name_map: Dict[str, str] = {}
         # fo_name -> list of semantic names (e.g., joint names)
         self._field_names_meta: Dict[str, List[str]] = {}
         # fo_name -> human-readable description string
@@ -268,10 +267,10 @@ class LeRobotDatasetImporter(GroupDatasetImporter):
         if not episode_files:
             raise ValueError(f"No episode metadata found in {episodes_dir}")
         
-        self._episodes_df = pd.concat(
-            [pd.read_parquet(f) for f in episode_files],
-            ignore_index=True
+        episodes_table = pa.concat_tables(
+            [pq.read_table(f) for f in episode_files]
         )
+        self._episodes = episodes_table.to_pylist()
         
         # Load tasks metadata - support multiple formats per v3.0 evolution
         # 1. tasks.parquet (single file) - common in practice
@@ -284,30 +283,45 @@ class LeRobotDatasetImporter(GroupDatasetImporter):
         self._task_mapping = {}  # task_string -> task_index
         
         if tasks_parquet.exists():
-            # Single parquet file - task strings are the index
-            self._tasks_df = pd.read_parquet(tasks_parquet)
-            # Build mapping: index is task string, column is task_index
-            for task_str, row in self._tasks_df.iterrows():
-                self._task_mapping[task_str] = int(row["task_index"])
+            tasks_table = pq.read_table(tasks_parquet)
+            self._load_task_mapping(tasks_table.to_pylist(), tasks_table.column_names)
         elif tasks_jsonl.exists():
-            # JSONL format per official v3.0 docs
-            self._tasks_df = pd.read_json(tasks_jsonl, lines=True)
-            # Assuming columns: task, task_index
-            for _, row in self._tasks_df.iterrows():
+            with open(tasks_jsonl) as f:
+                tasks_list = [json.loads(line) for line in f if line.strip()]
+            for row in tasks_list:
                 self._task_mapping[row.get("task", "")] = int(row.get("task_index", 0))
         elif tasks_dir.exists():
-            # Chunked parquet directory
             task_files = sorted(tasks_dir.glob("**/*.parquet"))
             if task_files:
-                self._tasks_df = pd.concat(
-                    [pd.read_parquet(f) for f in task_files],
-                    ignore_index=True
+                tasks_table = pa.concat_tables(
+                    [pq.read_table(f) for f in task_files]
                 )
-                for _, row in self._tasks_df.iterrows():
-                    self._task_mapping[row.get("task", "")] = int(row.get("task_index", 0))
+                self._load_task_mapping(tasks_table.to_pylist(), tasks_table.column_names)
         
-        print(f"Loaded metadata: {len(self._episodes_df)} episodes, "
+        print(f"Loaded metadata: {len(self._episodes)} episodes, "
               f"{len(self.camera_views)} cameras, {len(self._task_mapping)} tasks, FPS={self._fps}")
+    
+    def _load_task_mapping(self, rows: List[Dict], column_names: List[str]):
+        """
+        Build task_string -> task_index mapping from task rows.
+        
+        Handles two parquet layouts:
+        - Standard: columns "task" + "task_index"
+        - Pandas-index: task string stored as an index column (any string
+          column that isn't "task_index")
+        """
+        if "task" in column_names and "task_index" in column_names:
+            # Standard layout
+            for row in rows:
+                self._task_mapping[str(row["task"])] = int(row["task_index"])
+        elif "task_index" in column_names:
+            # Pandas-index layout: find the string column that holds task text
+            task_col = next(
+                (c for c in column_names if c != "task_index"), None
+            )
+            if task_col:
+                for row in rows:
+                    self._task_mapping[str(row[task_col])] = int(row["task_index"])
     
     def _detect_camera_views(self) -> List[str]:
         """
@@ -419,7 +433,6 @@ class LeRobotDatasetImporter(GroupDatasetImporter):
         SKIP_FIELDS = {"episode_index", "frame_index", "index", "task_index"}
         
         self._frame_fields = {}
-        self._field_name_map = {}
         self._field_names_meta = {}
         self._field_descriptions = {}
         
@@ -439,7 +452,7 @@ class LeRobotDatasetImporter(GroupDatasetImporter):
                 continue
             
             shape = feat_def.get("shape", [1])
-            is_scalar = int(np.prod(shape)) == 1
+            is_scalar = math.prod(shape) == 1
             
             # Convert LeRobot dot-notation to FiftyOne field name
             fo_name = lerobot_name.replace(".", "_")
@@ -450,8 +463,6 @@ class LeRobotDatasetImporter(GroupDatasetImporter):
                 "shape": shape,
                 "is_scalar": is_scalar,
             }
-            
-            self._field_name_map[fo_name] = lerobot_name
             
             # Store semantic names metadata if available
             names = feat_def.get("names")
@@ -469,13 +480,18 @@ class LeRobotDatasetImporter(GroupDatasetImporter):
             if desc_parts:
                 self._field_descriptions[fo_name] = " : ".join(desc_parts)
         
+        # Pre-compute the parquet columns we need to read
+        self._columns_to_read = [
+            fi["lerobot_name"] for fi in self._frame_fields.values()
+        ]
+        
         print(f"Frame field schema: {len(self._frame_fields)} fields "
               f"({sum(1 for f in self._frame_fields.values() if f['is_scalar'])} scalar, "
               f"{sum(1 for f in self._frame_fields.values() if not f['is_scalar'])} array)")
     
     def _build_episodes_list(self):
         """Build filtered list of episodes to import."""
-        episodes = self._episodes_df.to_dict("records")
+        episodes = list(self._episodes)
         
         if self.episode_ids is not None:
             episode_ids_set = set(self.episode_ids)
@@ -628,8 +644,18 @@ class LeRobotDatasetImporter(GroupDatasetImporter):
         
         return self.dataset_dir / rel_path
     
-    def _load_episode_frame_data(self, episode: Dict) -> Optional[pd.DataFrame]:
-        """Load frame-level data for an episode from parquet."""
+    def _load_episode_frame_data(self, episode: Dict):
+        """
+        Load frame-level data for an episode from parquet using PyArrow.
+        
+        Only reads the columns defined in _frame_fields (column pruning),
+        which significantly reduces I/O for datasets with many features.
+        Results are cached per parquet file since multiple episodes share
+        the same sharded file.
+        
+        Returns:
+            A PyArrow Table slice for this episode, or None if not found.
+        """
         chunk_idx = episode.get("data/chunk_index", episode.get("data_chunk_index", 0))
         file_idx = episode.get("data/file_index", episode.get("data_file_index", 0))
         from_idx = episode.get("dataset_from_index", 0)
@@ -637,42 +663,24 @@ class LeRobotDatasetImporter(GroupDatasetImporter):
         
         cache_key = (chunk_idx, file_idx)
         
-        if cache_key not in self._data_df_cache:
+        if cache_key not in self._data_table_cache:
             parquet_path = self._resolve_data_path(chunk_idx, file_idx)
-            if parquet_path.exists():
-                self._data_df_cache[cache_key] = pd.read_parquet(parquet_path)
-            else:
+            if not parquet_path.exists():
                 print(f"Warning: Parquet file not found: {parquet_path}")
                 return None
+            
+            # Only read the columns we actually need (column pruning)
+            available_cols = pq.read_schema(parquet_path).names
+            columns = [
+                c for c in self._columns_to_read if c in available_cols
+            ]
+            
+            self._data_table_cache[cache_key] = pq.read_table(
+                parquet_path, columns=columns
+            )
         
-        df = self._data_df_cache[cache_key]
-        return df.iloc[from_idx:to_idx].reset_index(drop=True)
-    
-    def _sanitize_value(self, value: Any) -> Any:
-        """Sanitize a value for FiftyOne/MongoDB compatibility.
-        
-        Recursively converts all numpy types to native Python types.
-        Handles object-dtype numpy arrays (e.g., nested arrays from parquet),
-        numpy scalars, and nested list/dict structures.
-        """
-        if value is None:
-            return None
-        elif isinstance(value, np.ndarray):
-            # .tolist() converts native-dtype arrays fully, but for
-            # object-dtype arrays it may leave nested numpy types intact.
-            # Recursively sanitize the result to be safe.
-            converted = value.tolist()
-            if isinstance(converted, list):
-                return [self._sanitize_value(v) for v in converted]
-            return converted
-        elif isinstance(value, (np.integer, np.floating, np.bool_)):
-            return value.item()
-        elif isinstance(value, (list, tuple)):
-            return [self._sanitize_value(v) for v in value]
-        elif isinstance(value, dict):
-            return {k: self._sanitize_value(v) for k, v in value.items()}
-        else:
-            return value
+        table = self._data_table_cache[cache_key]
+        return table.slice(from_idx, to_idx - from_idx)
     
     def _create_episode_samples(self, episode: Dict) -> List[Dict]:
         """Create sample dicts for one episode (all cameras)."""
@@ -780,46 +788,35 @@ class LeRobotDatasetImporter(GroupDatasetImporter):
         
         return samples
     
-    def _add_frame_data_to_sample(self, sample: fo.Sample, frame_data: pd.DataFrame):
+    def _add_frame_data_to_sample(self, sample: fo.Sample, frame_data):
         """
         Add frame-level data to video sample's frames.
         
         Uses the dynamic schema built from info.json features. For each field
-        in _frame_fields, extracts the column from the DataFrame and assigns
-        values to the corresponding FiftyOne frame, converting types as needed.
+        in _frame_fields, extracts the column from the PyArrow table and assigns
+        values to the corresponding FiftyOne frame.
+        
+        PyArrow's to_pylist() converts directly to native Python types
+        (float, int, bool, list) with no numpy intermediary, so no
+        additional type conversion is needed.
         """
-        num_frames = len(frame_data)
+        column_names = frame_data.column_names
         
         for fo_name, field_info in self._frame_fields.items():
             lerobot_name = field_info["lerobot_name"]
-            is_scalar = field_info["is_scalar"]
-            dtype = field_info["dtype"]
             
-            if lerobot_name not in frame_data.columns:
+            if lerobot_name not in column_names:
                 continue
             
-            # Extract the full column as a list (avoids slow iterrows)
-            values = frame_data[lerobot_name].tolist()
+            # to_pylist() converts directly to native Python types:
+            # float32/float64 → float, int64 → int, bool → bool,
+            # list<float32> → list[float], nested → nested lists
+            values = frame_data.column(lerobot_name).to_pylist()
             
             for i, val in enumerate(values):
-                fo_frame_num = i + 1  # FiftyOne frames are 1-indexed
-                
                 if val is None:
                     continue
-                
-                # Convert to appropriate Python type for FiftyOne/MongoDB
-                if is_scalar:
-                    if dtype in ("float32", "float64"):
-                        val = float(val)
-                    elif dtype == "int64":
-                        val = int(val)
-                    elif dtype == "bool":
-                        val = bool(val)
-                else:
-                    # Array value: convert numpy arrays / nested lists to plain lists
-                    val = self._sanitize_value(val)
-                
-                sample.frames[fo_frame_num][fo_name] = val
+                sample.frames[i + 1][fo_name] = val  # FiftyOne frames are 1-indexed
     
     def __len__(self) -> int:
         """Return number of groups (episodes) to import."""
@@ -918,7 +915,8 @@ class LeRobotDatasetImporter(GroupDatasetImporter):
             "group_field": self._group_field,
             "fps": self._fps,
             
-            # Feature definitions (shapes, dtypes) - important for understanding data
+            # Feature definitions (shapes, dtypes) - source of truth for export
+            # Per-field metadata is also on each field.info for convenience
             "features": self._dataset_info.get("features", {}),
             
             # Normalization statistics - critical for ML training
@@ -926,15 +924,6 @@ class LeRobotDatasetImporter(GroupDatasetImporter):
             
             # Task vocabulary
             "tasks": self._task_mapping,
-            
-            # Field mapping for export round-trip
-            # Maps FiftyOne field name -> LeRobot dot-notation name
-            # e.g., {"observation_state": "observation.state", ...}
-            "lerobot_field_map": dict(self._field_name_map),
-            
-            # Semantic names per field (joint names, axis names, etc.)
-            # e.g., {"observation_state": ["arm_lift_joint", "arm_flex_joint", ...]}
-            "field_names": dict(self._field_names_meta),
             
             # Video feature mapping: camera slice name -> full feature name
             # e.g., {"hand": "observation.image.hand", ...}
@@ -1012,7 +1001,7 @@ class LeRobotDatasetImporter(GroupDatasetImporter):
     
     def close(self, *args):
         """Clean up resources."""
-        self._data_df_cache.clear()
+        self._data_table_cache.clear()
         self._samples_iter = None
 
 
