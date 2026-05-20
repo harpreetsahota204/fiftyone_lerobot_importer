@@ -1205,6 +1205,7 @@ def import_lerobot_dataset(
     exclude_fields: Optional[List[str]] = None,
     max_samples: Optional[int] = None,
     overwrite: bool = False,
+    persistent: bool = True,
     **kwargs,
 ) -> fo.Dataset:
     """
@@ -1224,6 +1225,9 @@ def import_lerobot_dataset(
             (e.g., ["*.is_fresh"]). Applied after include_fields.
         max_samples: Maximum number of episodes to import
         overwrite: Whether to overwrite existing FiftyOne dataset
+        persistent: Mark the dataset as persistent so it survives across
+            Python sessions and FiftyOne service restarts (default True).
+            Set False for one-off / throwaway imports.
         **kwargs: Additional arguments passed to LeRobotDatasetImporter
         
     Returns:
@@ -1255,7 +1259,7 @@ def import_lerobot_dataset(
         **kwargs,
     )
     
-    dataset = fo.Dataset(name)
+    dataset = fo.Dataset(name, persistent=persistent)
     dataset.add_importer(importer, dynamic=True)
     apply_lerobot_field_descriptions(dataset)
     
