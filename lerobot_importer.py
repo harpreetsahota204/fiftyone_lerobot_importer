@@ -13,11 +13,11 @@ Reference: https://huggingface.co/docs/lerobot/lerobot-dataset-v3
 
 import fnmatch
 import json
-import random
-from pathlib import Path
-from typing import Dict, List, Optional, Any, Union, Iterator
-
 import math
+import random
+import warnings
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -54,14 +54,11 @@ class LeRobotDatasetImporter(GroupDatasetImporter):
     def __init__(
         self,
         dataset_dir: Union[str, Path] = None,
-        data_path: Optional[str] = None,
-        labels_path: Optional[str] = None,
         camera_views: Optional[List[str]] = None,
         episode_ids: Optional[List[int]] = None,
         task_ids: Optional[List[int]] = None,
         clips_dir: Optional[Union[str, Path]] = None,
         include_frame_data: bool = True,
-        include_metadata: bool = True,  # Alias for include_frame_data
         include_fields: Optional[List[str]] = None,
         exclude_fields: Optional[List[str]] = None,
         max_samples: Optional[int] = None,
@@ -77,14 +74,11 @@ class LeRobotDatasetImporter(GroupDatasetImporter):
         
         Args:
             dataset_dir: Root directory of the v3.0 dataset
-            data_path: Not used (for API compatibility)
-            labels_path: Not used (for API compatibility) 
             camera_views: List of camera views to import (None = auto-detect)
             episode_ids: Specific episode IDs to import (None = all)
             task_ids: Filter by task IDs (None = all)
             clips_dir: Directory for extracted episode clips
             include_frame_data: Whether to load frame-level states/actions
-            include_metadata: Alias for include_frame_data
             include_fields: Glob patterns for LeRobot field names to include
                 (e.g., ["observation.*", "action.*", "timestamp"]).
                 None means include all non-video fields.
@@ -97,13 +91,15 @@ class LeRobotDatasetImporter(GroupDatasetImporter):
             default_slice: Default camera slice name
             group_field: Name of the group field
             overwrite_clips: Whether to overwrite existing clips
+            **kwargs: Absorbs forwarded ``from_dir`` arguments (data_path,
+                labels_path, etc.) that this importer does not consume.
         """
         self.dataset_dir = Path(dataset_dir) if dataset_dir else None
         self.camera_views = camera_views
         self.episode_ids = episode_ids
         self.task_ids = task_ids
         self.clips_dir = Path(clips_dir) if clips_dir else None
-        self.include_frame_data = include_frame_data and include_metadata
+        self.include_frame_data = include_frame_data
         self.include_fields = include_fields
         self.exclude_fields = exclude_fields
         self.max_samples = max_samples
@@ -113,32 +109,58 @@ class LeRobotDatasetImporter(GroupDatasetImporter):
         self._group_field = group_field
         self.overwrite_clips = overwrite_clips
         
-        # Internal state
+        # Loaded metadata
         self._dataset_info: Optional[Dict] = None
-        self._episodes: Optional[List[Dict]] = None  # list of episode dicts
-        self._stats: Dict = {}  # stats.json contents
-        self._task_mapping: Dict[str, int] = {}  # task_string -> task_index
-        self._data_table_cache: Dict[tuple, Any] = {}  # PyArrow table cache
-        self._columns_to_read: Optional[List[str]] = None  # Parquet columns needed
-        self._video_splitter: Optional[VideoSplitter] = None
-        self._episodes_to_import: Optional[List[Dict]] = None
+        self._features: Dict[str, Dict] = {}      # info.json["features"], hoisted
+        self._stats: Dict = {}                     # stats.json contents
         self._fps: int = 30
+        self._video_path_template: str = ""
+        self._data_path_template: str = ""
         
-        # Video feature mapping: camera slice name -> full feature name
-        # e.g., {"top": "observation.images.top", "wrist": "observation.images.wrist"}
+        # Episode + task tables
+        self._episodes: Optional[List[Dict]] = None
+        self._episodes_to_import: Optional[List[Dict]] = None
+        self._task_mapping: Dict[str, int] = {}    # task_string -> task_index
+        self._tasks_by_index: Dict[int, str] = {}  # task_index -> task_string
+        # Trusted per-episode data location, rebuilt from actual shard
+        # contents at setup time. Some v3.0 datasets ship with stale
+        # data/chunk_index / data/file_index in episode metadata, and their
+        # dataset_from_index is a global row index that doesn't translate
+        # to a within-shard offset, so we can't trust the episode metadata
+        # alone. This map is the source of truth instead.
+        #     episode_index -> ((chunk_idx, file_idx), from_row, to_row)
+        # where (from_row, to_row) are within-shard slice offsets.
+        self._episode_location: Dict[
+            int, Tuple[Tuple[int, int], int, int]
+        ] = {}
+        
+        # Per-camera derived state, computed once after metadata load:
+        #   _video_feature_map[camera] -> full feature key
+        #   _camera_episode_keys[camera] -> (chunk_key, file_key, from_key, to_key)
+        #   _camera_dimensions[camera] -> (frame_height, frame_width) or (None, None)
         self._video_feature_map: Dict[str, str] = {}
+        self._camera_episode_keys: Dict[str, Tuple[str, str, str, str]] = {}
+        self._camera_dimensions: Dict[str, Tuple[Optional[int], Optional[int]]] = {}
         
-        # Frame field schema (built from info.json features)
-        # fo_name -> {"lerobot_name": str, "dtype": str, "shape": list, "is_scalar": bool}
+        # Frame field schema, built from info.json features:
+        #   _frame_fields[fo_name] = {"lerobot_name", "dtype", "shape"}
+        #   _field_names_meta[fo_name] = [semantic names]
+        #   _field_descriptions[fo_name] = human-readable string
         self._frame_fields: Dict[str, Dict] = {}
-        # fo_name -> list of semantic names (e.g., joint names)
         self._field_names_meta: Dict[str, List[str]] = {}
-        # fo_name -> human-readable description string
         self._field_descriptions: Dict[str, str] = {}
+        self._columns_to_read: List[str] = []
         
-        # Iteration state
+        # Runtime state
+        self._video_splitter: Optional[VideoSplitter] = None
+        self._data_table_cache: Dict[Tuple[int, int], Any] = {}
+        # Separate light-weight cache for the per-frame task_index column,
+        # used as a fallback when episode metadata lacks a 'tasks' field
+        self._task_index_cache: Dict[Tuple[int, int], Any] = {}
         self._samples_iter: Optional[Iterator] = None
-        self._num_samples: int = 0
+        # (chunk_idx, file_idx) -> last episode_index using that shard;
+        # drives parquet cache eviction during lazy iteration
+        self._last_episode_for_shard: Dict[Tuple[int, int], int] = {}
     
     @property
     def group_field(self) -> str:
@@ -161,37 +183,75 @@ class LeRobotDatasetImporter(GroupDatasetImporter):
         return False
     
     def setup(self):
-        """Setup method called before iteration begins."""
+        """Prepare the importer for iteration.
+        
+        Performs lightweight work only — validation, metadata loading,
+        episode filtering, and cache pre-computation. Clip extraction and
+        parquet reads happen lazily during iteration so the first sample
+        flows immediately rather than after the entire ffmpeg pass.
+        """
         if self.dataset_dir is None:
             raise ValueError("dataset_dir is required")
         
-        # Set clips_dir default
         if self.clips_dir is None:
             self.clips_dir = self.dataset_dir / "episode_clips"
         
-        # Validate v3.0 structure
-        self._validate_v3_structure()
+        info = self._validate_v3_structure()
+        self._load_metadata(info)
         
-        # Load metadata
-        self._load_metadata()
-        
-        # Initialize video splitter
         self._video_splitter = VideoSplitter(
-            self.clips_dir, 
-            overwrite=self.overwrite_clips
+            self.clips_dir, overwrite=self.overwrite_clips
         )
         
-        # Build list of episodes to import
         self._build_episodes_list()
+        self._last_episode_for_shard = self._compute_shard_eviction_points()
         
-        # Pre-compute all samples for iteration
-        self._build_samples_iterator()
+        # Announce extraction plan up front by probing one source video.
+        if self._episodes_to_import:
+            if self._check_needs_reencode():
+                print(
+                    "\nSource videos require re-encoding to H.264 for "
+                    "browser playback (source codec is not H.264/yuv420p)."
+                )
+            else:
+                print(
+                    "\nSource videos are already H.264/yuv420p; "
+                    "using fast stream copy."
+                )
         
-        print(f"Setup complete: {self._num_samples} samples from "
-              f"{len(self._episodes_to_import)} episodes")
+        # Upper bound on sample count (one per camera per episode); the
+        # actual count may be lower if any source videos are missing.
+        approx_samples = len(self._episodes_to_import) * len(self.camera_views)
+        print(
+            f"Setup complete: ~{approx_samples} samples from "
+            f"{len(self._episodes_to_import)} episodes "
+            f"(extraction will run lazily during import)"
+        )
     
-    def _validate_v3_structure(self):
-        """Validate that dataset is v3.0 format."""
+    def _compute_shard_eviction_points(self) -> Dict[Tuple[int, int], int]:
+        """Return {(chunk_idx, file_idx): last_episode_index_using_shard}.
+        
+        Used by ``_iter_sample_groups`` to drop cached PyArrow tables
+        as soon as they're no longer needed, keeping memory bounded.
+        """
+        return {
+            self._episode_shard_key(ep): ep["episode_index"]
+            for ep in self._episodes_to_import
+        }
+    
+    # Required subdirectories for a valid v3.0 dataset layout
+    _REQUIRED_SUBDIRS = (
+        ("data", "Parquet data files"),
+        ("videos", "Video files"),
+        ("meta/episodes", "Episode metadata"),
+    )
+    
+    def _validate_v3_structure(self) -> Dict:
+        """Validate the on-disk dataset layout and return the parsed ``info.json``.
+        
+        Returning the parsed dict here lets ``_load_metadata`` reuse it
+        rather than re-reading the file.
+        """
         if not self.dataset_dir.exists():
             raise ValueError(f"Dataset directory not found: {self.dataset_dir}")
         
@@ -214,14 +274,7 @@ class LeRobotDatasetImporter(GroupDatasetImporter):
                 f"https://github.com/huggingface/lerobot/blob/main/src/lerobot/datasets/v30/convert_dataset_v21_to_v30.py"
             )
         
-        # Check for required directories
-        required_dirs = [
-            ("data", "Parquet data files"),
-            ("videos", "Video files"),
-            ("meta/episodes", "Episode metadata"),
-        ]
-        
-        for dir_path, description in required_dirs:
+        for dir_path, description in self._REQUIRED_SUBDIRS:
             full_path = self.dataset_dir / dir_path
             if not full_path.exists():
                 raise ValueError(
@@ -229,41 +282,54 @@ class LeRobotDatasetImporter(GroupDatasetImporter):
                 )
         
         print(f"Validated v3.0 dataset at {self.dataset_dir}")
+        return info
     
-    def _load_metadata(self):
-        """Load all metadata from the dataset."""
+    def _load_metadata(self, info: Dict):
+        """Load all metadata from the dataset and pre-compute derived caches.
+        
+        Args:
+            info: Pre-parsed ``info.json`` contents (from
+                ``_validate_v3_structure``) so we don't read the file twice.
+        """
         meta_dir = self.dataset_dir / "meta"
         
-        # Load info.json
-        with open(meta_dir / "info.json") as f:
-            self._dataset_info = json.load(f)
-        
+        self._dataset_info = info
+        self._features = self._dataset_info.get("features", {})
         self._fps = int(self._dataset_info.get("fps", 30))
+        self._video_path_template = self._dataset_info.get(
+            "video_path",
+            "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+        )
+        self._data_path_template = self._dataset_info.get(
+            "data_path",
+            "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+        )
         
-        # Load stats.json (normalization statistics for ML training)
+        # stats.json holds normalization statistics for ML training (optional)
         stats_path = meta_dir / "stats.json"
         if stats_path.exists():
             with open(stats_path) as f:
                 self._stats = json.load(f)
-        else:
-            self._stats = {}
         
-        # Auto-detect camera views from features if not specified
-        if self.camera_views is None:
-            self.camera_views = self._detect_camera_views()
-            print(f"Auto-detected camera views: {self.camera_views}")
-        
-        # Set default slice
-        if self.default_slice is None and self.camera_views:
+        # Always discover the full slice-name -> feature-key map up front;
+        # then resolve (or filter to) whatever the user asked for.
+        self._build_video_feature_map()
+        self.camera_views = self._resolve_camera_views(self.camera_views)
+        if not self.camera_views:
+            raise ValueError(
+                f"No camera views available in {self.dataset_dir}. "
+                f"Found no 'video' features in info.json and no "
+                f"subdirectories in videos/."
+            )
+        if self.default_slice is None:
             self.default_slice = self.camera_views[0]
         
-        # Build frame field schema from info.json features
+        self._build_per_camera_caches()
         self._build_frame_field_schema()
         
-        # Load episodes metadata (chunked parquet)
+        # Episode metadata (chunked parquet under meta/episodes/)
         episodes_dir = meta_dir / "episodes"
         episode_files = sorted(episodes_dir.glob("**/*.parquet"))
-        
         if not episode_files:
             raise ValueError(f"No episode metadata found in {episodes_dir}")
         
@@ -272,451 +338,581 @@ class LeRobotDatasetImporter(GroupDatasetImporter):
         )
         self._episodes = episodes_table.to_pylist()
         
-        # Load tasks metadata - support multiple formats per v3.0 evolution
-        # 1. tasks.parquet (single file) - common in practice
-        # 2. tasks.jsonl (single file) - per official docs
-        # 3. tasks/ directory (chunked parquet) - for scalability
+        # Task vocabulary — v3.0 has shipped in three layouts over time:
+        #   tasks.parquet   single file (most common in practice)
+        #   tasks.jsonl     single file (per official docs)
+        #   tasks/*.parquet chunked directory (for very large vocabularies)
         tasks_parquet = meta_dir / "tasks.parquet"
         tasks_jsonl = meta_dir / "tasks.jsonl"
         tasks_dir = meta_dir / "tasks"
         
-        self._task_mapping = {}  # task_string -> task_index
-        
         if tasks_parquet.exists():
-            tasks_table = pq.read_table(tasks_parquet)
-            self._load_task_mapping(tasks_table.to_pylist(), tasks_table.column_names)
+            tbl = pq.read_table(tasks_parquet)
+            self._load_task_mapping(tbl.to_pylist(), tbl.column_names)
         elif tasks_jsonl.exists():
             with open(tasks_jsonl) as f:
-                tasks_list = [json.loads(line) for line in f if line.strip()]
-            for row in tasks_list:
-                self._task_mapping[row.get("task", "")] = int(row.get("task_index", 0))
+                for line in f:
+                    if line.strip():
+                        row = json.loads(line)
+                        self._task_mapping[row.get("task", "")] = int(
+                            row.get("task_index", 0)
+                        )
         elif tasks_dir.exists():
             task_files = sorted(tasks_dir.glob("**/*.parquet"))
             if task_files:
-                tasks_table = pa.concat_tables(
-                    [pq.read_table(f) for f in task_files]
-                )
-                self._load_task_mapping(tasks_table.to_pylist(), tasks_table.column_names)
+                tbl = pa.concat_tables([pq.read_table(f) for f in task_files])
+                self._load_task_mapping(tbl.to_pylist(), tbl.column_names)
         
-        print(f"Loaded metadata: {len(self._episodes)} episodes, "
-              f"{len(self.camera_views)} cameras, {len(self._task_mapping)} tasks, FPS={self._fps}")
+        # Reverse mapping for index -> string lookups (used when episode
+        # metadata lacks a 'tasks' field and we have to decode per-frame
+        # task_index values back to their natural-language task string).
+        self._tasks_by_index = {v: k for k, v in self._task_mapping.items()}
+        
+        # Scan data shards to build the trusted episode -> shard map.
+        self._build_episode_location_map()
+        
+        print(
+            f"Loaded metadata: {len(self._episodes)} episodes, "
+            f"{len(self.camera_views)} cameras, "
+            f"{len(self._task_mapping)} tasks, FPS={self._fps}"
+        )
+    
+    def _build_episode_location_map(self):
+        """Scan every data parquet shard once to map episodes to their real location.
+        
+        Reads only the ``episode_index`` column from each shard (cheap), then
+        walks the column to identify contiguous runs and record each
+        episode's within-shard slice offsets. The resulting map is the only
+        reliable way to read frame data when episode metadata's
+        ``data/file_index`` or ``dataset_from_index`` fields are stale or
+        global-rather-than-shard-local (as in ``lerobot/libero``).
+        """
+        data_dir = self.dataset_dir / "data"
+        shard_files = sorted(data_dir.glob("**/*.parquet"))
+        if not shard_files:
+            return
+        
+        for path in shard_files:
+            shard_key = self._parse_shard_key_from_path(path)
+            if shard_key is None:
+                continue
+            
+            table = pq.read_table(path, columns=["episode_index"])
+            ep_col = table.column("episode_index").to_pylist()
+            if not ep_col:
+                continue
+            
+            # Walk the column once, recording contiguous (episode, start, end)
+            # runs. Within a shard, each episode's rows are contiguous.
+            current_ep = ep_col[0]
+            run_start = 0
+            for i in range(1, len(ep_col)):
+                if ep_col[i] != current_ep:
+                    self._episode_location[int(current_ep)] = (
+                        shard_key, run_start, i
+                    )
+                    current_ep = ep_col[i]
+                    run_start = i
+            self._episode_location[int(current_ep)] = (
+                shard_key, run_start, len(ep_col)
+            )
+    
+    @staticmethod
+    def _parse_shard_key_from_path(path: Path) -> Optional[Tuple[int, int]]:
+        """Extract ``(chunk_index, file_index)`` from a ``chunk-NNN/file-MMM.parquet`` path."""
+        try:
+            chunk_idx = int(path.parent.name.replace("chunk-", ""))
+            file_idx = int(path.stem.replace("file-", ""))
+        except ValueError:
+            return None
+        return chunk_idx, file_idx
+    
+    def _build_per_camera_caches(self):
+        """Pre-compute per-camera lookup keys and frame dimensions.
+        
+        Run once after ``camera_views`` and ``_video_feature_map`` are known
+        so the hot path in ``_create_episode_samples`` does only dict lookups.
+        """
+        for camera in self.camera_views:
+            # _resolve_camera_views guarantees every entry is in the map
+            video_key = self._video_feature_map[camera]
+            self._camera_episode_keys[camera] = (
+                f"videos/{video_key}/chunk_index",
+                f"videos/{video_key}/file_index",
+                f"videos/{video_key}/from_timestamp",
+                f"videos/{video_key}/to_timestamp",
+            )
+            shape = self._features.get(video_key, {}).get("shape", [])
+            height = shape[0] if len(shape) > 0 else None
+            width = shape[1] if len(shape) > 1 else None
+            self._camera_dimensions[camera] = (height, width)
+    
+    def _episode_shard_key(self, episode: Dict) -> Tuple[int, int]:
+        """Return the (chunk_index, file_index) tuple for an episode's data shard.
+        
+        Prefers the trusted ``_episode_location`` map (built by scanning
+        shard contents at setup). Falls back to the episode metadata's
+        ``data/chunk_index`` + ``data/file_index`` only if the scan didn't
+        cover this episode (which shouldn't happen for a well-formed
+        dataset, but the fallback keeps the method total).
+        """
+        location = self._episode_location.get(int(episode["episode_index"]))
+        if location is not None:
+            return location[0]
+        chunk = episode.get("data/chunk_index", episode.get("data_chunk_index", 0))
+        file_ = episode.get("data/file_index", episode.get("data_file_index", 0))
+        return int(chunk), int(file_)
+    
+    def _episode_row_range(self, episode: Dict) -> Tuple[int, int]:
+        """Return ``(from_row, to_row)`` within-shard slice offsets for ``episode``.
+        
+        Prefers the trusted ``_episode_location`` map; falls back to the
+        episode metadata's ``dataset_from_index`` / ``dataset_to_index``
+        (only correct when there's a single shard or the values happen to
+        align with shard boundaries).
+        """
+        location = self._episode_location.get(int(episode["episode_index"]))
+        if location is not None:
+            _, from_row, to_row = location
+            return from_row, to_row
+        from_row = int(episode.get("dataset_from_index", 0))
+        to_row = int(episode.get(
+            "dataset_to_index", from_row + episode.get("length", 0)
+        ))
+        return from_row, to_row
     
     def _load_task_mapping(self, rows: List[Dict], column_names: List[str]):
-        """
-        Build task_string -> task_index mapping from task rows.
+        """Build the ``task_string -> task_index`` mapping from task rows.
         
-        Handles two parquet layouts:
-        - Standard: columns "task" + "task_index"
-        - Pandas-index: task string stored as an index column (any string
-          column that isn't "task_index")
+        Two parquet layouts are seen in the wild:
+        
+        - Standard: columns ``"task"`` and ``"task_index"``.
+        - Pandas-style: ``"task_index"`` plus a string column holding the task
+          text (whatever its name is — pandas may have written the index out
+          under any label).
         """
         if "task" in column_names and "task_index" in column_names:
-            # Standard layout
             for row in rows:
                 self._task_mapping[str(row["task"])] = int(row["task_index"])
-        elif "task_index" in column_names:
-            # Pandas-index layout: find the string column that holds task text
-            task_col = next(
-                (c for c in column_names if c != "task_index"), None
-            )
-            if task_col:
-                for row in rows:
-                    self._task_mapping[str(row[task_col])] = int(row["task_index"])
-    
-    def _detect_camera_views(self) -> List[str]:
-        """
-        Auto-detect camera views from dataset features.
+            return
         
-        Builds _video_feature_map mapping slice names to full feature names.
-        Uses common-prefix stripping so camera names are unique and concise.
-        Dots are replaced with underscores since FiftyOne group slice names
-        are stored in MongoDB which uses dots for nested field access.
+        if "task_index" not in column_names:
+            return
+        
+        task_col = next((c for c in column_names if c != "task_index"), None)
+        if task_col is None:
+            return
+        for row in rows:
+            self._task_mapping[str(row[task_col])] = int(row["task_index"])
+    
+    def _build_video_feature_map(self):
+        """Populate ``_video_feature_map`` (slice name -> full feature key).
+        
+        Always runs (regardless of whether the user supplied ``camera_views``)
+        so resolution is uniform downstream. Slice names are derived from the
+        video feature keys by stripping the longest common dot-segment prefix
+        and joining the remainder with underscores (dots are reserved by
+        MongoDB for nested field access).
         
         Examples:
-        - ["observation.images.top", "observation.images.wrist"] -> ["top", "wrist"]
-        - ["observation.images.wrist.top", "observation.images.top.front"] -> ["wrist_top", "top_front"]
-        - ["observation.images.rgb.head", "observation.images.depth.head"] -> ["rgb_head", "depth_head"]
-        - ["observation.images.front_view"] (single) -> ["front_view"]
+        
+        - ``["observation.images.top", "observation.images.wrist"]``
+          -> ``{"top": ..., "wrist": ...}``
+        - ``["observation.images.wrist.top", "observation.images.top.front"]``
+          -> ``{"wrist_top": ..., "top_front": ...}``
+        - ``["observation.images.rgb.head", "observation.images.depth.head"]``
+          -> ``{"rgb_head": ..., "depth_head": ...}``
+        - ``["observation.images.front_view"]`` -> ``{"front_view": ...}``
         """
-        features = self._dataset_info.get("features", {})
         video_keys = [
-            key for key, feat in features.items()
+            key for key, feat in self._features.items()
             if feat.get("dtype") == "video"
         ]
         
+        # Fallback: when info.json lacks video features, scan the videos dir.
+        # In this fallback world the subdir name is also the "feature key".
         if not video_keys:
-            # Fallback: scan videos directory
             videos_dir = self.dataset_dir / "videos"
             if videos_dir.exists():
-                for d in videos_dir.iterdir():
-                    if d.is_dir() and not d.name.startswith("."):
-                        video_keys.append(d.name)
+                video_keys = [
+                    d.name for d in videos_dir.iterdir()
+                    if d.is_dir() and not d.name.startswith(".")
+                ]
         
         if not video_keys:
-            return []
+            return
         
         if len(video_keys) == 1:
-            # Single camera: use last segment
             key = video_keys[0]
-            camera_name = key.split(".")[-1]
-            self._video_feature_map[camera_name] = key
-            return [camera_name]
+            self._video_feature_map[key.split(".")[-1]] = key
+            return
         
-        # Multiple cameras: find longest common dot-segment prefix
+        # Strip the longest common leading dot-segment prefix.
         parts_list = [key.split(".") for key in video_keys]
         prefix_len = 0
         for segments in zip(*parts_list):
-            if len(set(segments)) == 1:
-                prefix_len += 1
-            else:
+            if len(set(segments)) != 1:
                 break
+            prefix_len += 1
         
-        cameras = []
         for key in video_keys:
-            parts = key.split(".")
-            # Join remaining segments with underscore (dots break MongoDB)
-            camera_name = "_".join(parts[prefix_len:])
-            cameras.append(camera_name)
-            self._video_feature_map[camera_name] = key
+            self._video_feature_map["_".join(key.split(".")[prefix_len:])] = key
+    
+    def _resolve_camera_views(
+        self, requested: Optional[List[str]]
+    ) -> List[str]:
+        """Return the final list of slice names to import.
         
-        return sorted(cameras)
+        If ``requested`` is None, return all auto-detected slices (sorted).
+        Otherwise resolve each requested entry against:
+        
+        1. a known slice name (the keys of ``_video_feature_map``),
+        2. a full feature key (the values), or
+        3. a videos-subdir-style name (the legacy fallback case).
+        
+        Raises ``ValueError`` with a useful "did you mean ..." message if any
+        entry doesn't resolve, so users don't silently get a 0-sample import.
+        """
+        if requested is None:
+            return sorted(self._video_feature_map)
+        
+        # Reverse lookup: feature key -> slice name
+        key_to_slice = {v: k for k, v in self._video_feature_map.items()}
+        
+        resolved: List[str] = []
+        unknown: List[str] = []
+        for name in requested:
+            if name in self._video_feature_map:
+                resolved.append(name)
+            elif name in key_to_slice:
+                resolved.append(key_to_slice[name])
+            else:
+                unknown.append(name)
+        
+        if unknown:
+            available = sorted(self._video_feature_map)
+            raise ValueError(
+                f"Unknown camera_views entries: {unknown}. "
+                f"Available slice names: {available}. "
+                f"You may also pass full feature keys: "
+                f"{sorted(self._video_feature_map.values())}"
+            )
+        return resolved
     
     def _should_include_field(self, lerobot_name: str) -> bool:
+        """Return True if ``lerobot_name`` passes the include/exclude filters.
+        
+        Patterns are ``fnmatch`` globs evaluated against the original
+        LeRobot dot-notation name (e.g. ``"observation.state"``).
         """
-        Check if a field passes include/exclude filters.
-        
-        Filters use fnmatch glob patterns against the LeRobot dot-notation
-        field name (e.g., "observation.state", "action.absolute").
-        
-        Args:
-            lerobot_name: The LeRobot field name (dot notation)
-            
-        Returns:
-            True if the field should be included
-        """
-        if self.include_fields is not None:
-            if not any(
-                fnmatch.fnmatch(lerobot_name, pat)
-                for pat in self.include_fields
-            ):
-                return False
-        
-        if self.exclude_fields is not None:
-            if any(
-                fnmatch.fnmatch(lerobot_name, pat)
-                for pat in self.exclude_fields
-            ):
-                return False
-        
+        if self.include_fields is not None and not any(
+            fnmatch.fnmatch(lerobot_name, p) for p in self.include_fields
+        ):
+            return False
+        if self.exclude_fields is not None and any(
+            fnmatch.fnmatch(lerobot_name, p) for p in self.exclude_fields
+        ):
+            return False
         return True
+    
+    # Fields stored on the sample (or reconstructible from frame numbering)
+    # rather than as per-frame FiftyOne fields
+    _SKIP_FRAME_FIELDS = frozenset(
+        {"episode_index", "frame_index", "index", "task_index"}
+    )
     
     def _build_frame_field_schema(self):
         """
-        Build frame field schema from info.json features.
+        Build the frame field schema from ``info.json`` features.
         
-        Reads the features dict and creates a mapping from FiftyOne field names
-        to parsing metadata. This drives all dynamic frame data import.
+        Each non-video, non-skipped feature becomes one FiftyOne frame field.
+        Type derivation (info.json dtype + shape -> FiftyOne field type):
         
-        The mapping rule from info.json dtype + shape to FiftyOne field types:
-            video              -> skip (handled as group slices)
-            float32/float64 [1]  -> FloatField (Python float)
-            float32/float64 [N]  -> ListField  (Python list of floats)
-            int64           [1]  -> IntField   (Python int)
-            int64           [N]  -> ListField  (Python list of ints)
-            bool            [1]  -> BooleanField (Python bool)
-            bool            [N]  -> ListField  (Python list of bools)
+            float32/64 shape=[1] -> FloatField    (Python float)
+            float32/64 shape=[N] -> ListField     (Python list[float])
+            int64      shape=[1] -> IntField      (Python int)
+            int64      shape=[N] -> ListField     (Python list[int])
+            bool       shape=[1] -> BooleanField  (Python bool)
+            bool       shape=[N] -> ListField     (Python list[bool])
         """
-        features = self._dataset_info.get("features", {})
-        
-        # Fields to skip at frame level — already stored on the sample
-        # or reconstructible from FiftyOne's frame numbering
-        SKIP_FIELDS = {"episode_index", "frame_index", "index", "task_index"}
-        
-        self._frame_fields = {}
-        self._field_names_meta = {}
-        self._field_descriptions = {}
-        
-        for lerobot_name, feat_def in features.items():
+        scalar_count = 0
+        for lerobot_name, feat_def in self._features.items():
             dtype = feat_def.get("dtype", "")
-            
-            # Skip video features (handled as group slices)
-            if dtype == "video":
+            if dtype == "video" or lerobot_name in self._SKIP_FRAME_FIELDS:
                 continue
-            
-            # Skip redundant fields
-            if lerobot_name in SKIP_FIELDS:
-                continue
-            
-            # Apply include/exclude filters
             if not self._should_include_field(lerobot_name):
                 continue
             
             shape = feat_def.get("shape", [1])
-            is_scalar = math.prod(shape) == 1
-            
-            # Convert LeRobot dot-notation to FiftyOne field name
+            # FiftyOne field names cannot contain dots (MongoDB nested access)
             fo_name = lerobot_name.replace(".", "_")
             
             self._frame_fields[fo_name] = {
                 "lerobot_name": lerobot_name,
                 "dtype": dtype,
                 "shape": shape,
-                "is_scalar": is_scalar,
             }
+            if math.prod(shape) == 1:
+                scalar_count += 1
             
-            # Store semantic names metadata if available
             names = feat_def.get("names")
             if names:
                 self._field_names_meta[fo_name] = names
             
-            # Build human-readable description from info.json metadata
             description = feat_def.get("description")
             desc_parts = []
             if description:
                 desc_parts.append(description)
             if names:
-                names_str = "[" + ", ".join(names) + "]"
-                desc_parts.append(names_str)
+                desc_parts.append("[" + ", ".join(names) + "]")
             if desc_parts:
                 self._field_descriptions[fo_name] = " : ".join(desc_parts)
         
-        # Pre-compute the parquet columns we need to read
+        # Parquet column projection: only read columns we'll actually use
         self._columns_to_read = [
             fi["lerobot_name"] for fi in self._frame_fields.values()
         ]
         
-        print(f"Frame field schema: {len(self._frame_fields)} fields "
-              f"({sum(1 for f in self._frame_fields.values() if f['is_scalar'])} scalar, "
-              f"{sum(1 for f in self._frame_fields.values() if not f['is_scalar'])} array)")
+        total = len(self._frame_fields)
+        print(
+            f"Frame field schema: {total} fields "
+            f"({scalar_count} scalar, {total - scalar_count} array)"
+        )
     
     def _build_episodes_list(self):
-        """Build filtered list of episodes to import."""
+        """Apply user-supplied filters and produce the episode iteration order."""
         episodes = list(self._episodes)
         
         if self.episode_ids is not None:
-            episode_ids_set = set(self.episode_ids)
-            episodes = [e for e in episodes if e["episode_index"] in episode_ids_set]
+            wanted = set(self.episode_ids)
+            episodes = [e for e in episodes if e["episode_index"] in wanted]
         
         if self.task_ids is not None:
-            task_ids_set = set(self.task_ids)
-            episodes = [e for e in episodes if e.get("task_index") in task_ids_set]
+            wanted = set(self.task_ids)
+            episodes = [e for e in episodes if e.get("task_index") in wanted]
         
         if self.shuffle:
-            if self.seed is not None:
-                random.seed(self.seed)
-            random.shuffle(episodes)
+            rng = random.Random(self.seed)
+            rng.shuffle(episodes)
         
         if self.max_samples is not None:
-            episodes = episodes[:self.max_samples]
+            episodes = episodes[: self.max_samples]
         
         self._episodes_to_import = episodes
     
     def _check_needs_reencode(self) -> bool:
-        """
-        Check if the source videos need re-encoding by probing the first video.
+        """Probe the first episode's first camera to decide whether the
+        source codec requires re-encoding.
         
         Returns:
-            True if re-encoding is needed (non-H.264 source), False if stream
-            copy can be used.
+            True if at least one re-encode is expected, False if stream copy
+            will work. Returns False for empty datasets or missing sources
+            (the per-clip path will skip them with a warning anyway).
         """
         if not self._episodes_to_import or not self.camera_views:
             return False
         
-        # Probe the first episode's first camera to determine codec
         episode = self._episodes_to_import[0]
         camera = self.camera_views[0]
-        video_key = self._video_feature_map.get(camera, camera)
-        
-        chunk_key = f"videos/{video_key}/chunk_index"
-        file_key = f"videos/{video_key}/file_index"
-        
+        chunk_key, file_key, _, _ = self._camera_episode_keys[camera]
         if chunk_key not in episode:
             return False
         
         source_video = self._resolve_video_path(
-            camera,
-            int(episode[chunk_key]),
-            int(episode[file_key]),
+            camera, int(episode[chunk_key]), int(episode[file_key])
         )
-        
         if not source_video.exists():
             return False
         
-        return not self._video_splitter._is_browser_compatible(source_video)
+        return not self._video_splitter.is_browser_compatible(source_video)
     
-    def _build_samples_iterator(self):
-        """Build iterator over all sample groups (one group per episode)."""
-        num_episodes = len(self._episodes_to_import)
-        num_cameras = len(self.camera_views)
+    def _iter_sample_groups(self) -> Iterator[List[Dict]]:
+        """Lazily yield one episode's worth of sample dicts at a time.
         
-        # Count how many clips need extraction vs are already cached
-        clips_to_extract = 0
-        clips_cached = 0
+        Performs clip extraction and parquet reads on demand. Evicts both
+        parquet shard caches (frame data + task_index fallback) once the
+        last episode using a shard has been emitted, keeping memory bounded
+        for large datasets.
+        """
         for episode in self._episodes_to_import:
-            for camera in self.camera_views:
-                if self._video_splitter.episode_exists(
-                    episode["episode_index"], camera
-                ):
-                    clips_cached += 1
-                else:
-                    clips_to_extract += 1
-        
-        # Print extraction notice
-        if clips_to_extract > 0:
-            needs_reencode = self._check_needs_reencode()
-            if needs_reencode:
-                print(
-                    f"\nSource videos require re-encoding to H.264 for "
-                    f"browser playback (source codec is not H.264/yuv420p).\n"
-                    f"Extracting {clips_to_extract} clips "
-                    f"({num_episodes} episodes x {num_cameras} cameras). "
-                    f"This may take a while..."
-                )
-            else:
-                print(
-                    f"\nExtracting {clips_to_extract} clips "
-                    f"({num_episodes} episodes x {num_cameras} cameras) "
-                    f"using fast stream copy..."
-                )
-            if clips_cached > 0:
-                print(f"  {clips_cached} clips already cached, will be skipped.")
-        else:
-            print(f"\nAll {clips_cached} episode clips already cached.")
-        
-        # Build sample groups with progress bar
-        all_groups = []
-        
-        try:
-            from tqdm import tqdm
-            episodes_iter = tqdm(
-                self._episodes_to_import,
-                desc="Processing episodes",
-                unit="ep",
-            )
-        except ImportError:
-            episodes_iter = self._episodes_to_import
-        
-        for episode in episodes_iter:
-            # Returns list of sample dicts for this episode (one per camera)
             samples = self._create_episode_samples(episode)
+            
+            shard_key = self._episode_shard_key(episode)
+            if self._last_episode_for_shard.get(shard_key) == episode["episode_index"]:
+                self._data_table_cache.pop(shard_key, None)
+                self._task_index_cache.pop(shard_key, None)
+            
             if samples:
-                all_groups.append(samples)
-        
-        # Count total individual samples
-        self._num_samples = sum(len(group) for group in all_groups)
-        self._samples_iter = iter(all_groups)
+                yield samples
     
     def _resolve_video_path(self, camera: str, chunk_idx: int, file_idx: int) -> Path:
-        """
-        Resolve path to sharded video file.
-        
-        Uses the video_path template from info.json with the full feature name.
-        """
-        # Get full feature name from mapping (e.g., "top" -> "observation.images.top")
-        video_key = self._video_feature_map.get(camera, camera)
-        
-        # Use path template from info.json if available
-        path_template = self._dataset_info.get(
-            "video_path", 
-            "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
-        )
-        
-        # Format the path
-        rel_path = path_template.format(
-            video_key=video_key,
+        """Resolve the on-disk path to a sharded source MP4 for ``camera``."""
+        rel_path = self._video_path_template.format(
+            video_key=self._video_feature_map[camera],
             chunk_index=chunk_idx,
             file_index=file_idx,
         )
-        
         return self.dataset_dir / rel_path
     
     def _resolve_data_path(self, chunk_idx: int, file_idx: int) -> Path:
-        """Resolve path to sharded parquet file using template from info.json."""
-        path_template = self._dataset_info.get(
-            "data_path",
-            "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
-        )
-        
-        rel_path = path_template.format(
+        """Resolve the on-disk path to a sharded parquet data file."""
+        rel_path = self._data_path_template.format(
             chunk_index=chunk_idx,
             file_index=file_idx,
         )
-        
         return self.dataset_dir / rel_path
     
     def _load_episode_frame_data(self, episode: Dict):
-        """
-        Load frame-level data for an episode from parquet using PyArrow.
+        """Load and slice the per-frame parquet rows for one episode.
         
-        Only reads the columns defined in _frame_fields (column pruning),
-        which significantly reduces I/O for datasets with many features.
-        Results are cached per parquet file since multiple episodes share
-        the same sharded file.
+        Uses column pruning (only reads ``_columns_to_read``) and caches the
+        full shard between episodes — multiple episodes typically share a
+        shard, so this turns N parquet reads into M shard reads (M << N).
+        Slice offsets come from the trusted ``_episode_location`` map (see
+        ``_build_episode_location_map``) rather than the often-stale
+        ``dataset_from_index`` / ``dataset_to_index`` fields in episode
+        metadata.
         
         Returns:
-            A PyArrow Table slice for this episode, or None if not found.
+            A PyArrow Table slice for this episode, or ``None`` if the shard
+            is missing on disk.
         """
-        chunk_idx = episode.get("data/chunk_index", episode.get("data_chunk_index", 0))
-        file_idx = episode.get("data/file_index", episode.get("data_file_index", 0))
-        from_idx = episode.get("dataset_from_index", 0)
-        to_idx = episode.get("dataset_to_index", from_idx + episode.get("length", 0))
+        shard_key = self._episode_shard_key(episode)
+        from_row, to_row = self._episode_row_range(episode)
         
-        cache_key = (chunk_idx, file_idx)
-        
-        if cache_key not in self._data_table_cache:
-            parquet_path = self._resolve_data_path(chunk_idx, file_idx)
+        table = self._data_table_cache.get(shard_key)
+        if table is None:
+            parquet_path = self._resolve_data_path(*shard_key)
             if not parquet_path.exists():
                 print(f"Warning: Parquet file not found: {parquet_path}")
                 return None
             
-            # Only read the columns we actually need (column pruning)
-            available_cols = pq.read_schema(parquet_path).names
-            columns = [
-                c for c in self._columns_to_read if c in available_cols
-            ]
-            
-            self._data_table_cache[cache_key] = pq.read_table(
-                parquet_path, columns=columns
-            )
+            available_cols = set(pq.read_schema(parquet_path).names)
+            columns = [c for c in self._columns_to_read if c in available_cols]
+            table = pq.read_table(parquet_path, columns=columns)
+            self._data_table_cache[shard_key] = table
         
-        table = self._data_table_cache[cache_key]
-        return table.slice(from_idx, to_idx - from_idx)
+        return table.slice(from_row, to_row - from_row)
+    
+    def _resolve_episode_task(
+        self, episode: Dict
+    ) -> Tuple[Optional[str], Optional[int]]:
+        """Return ``(task_string, task_index)`` for one episode.
+        
+        Tries layouts in priority order:
+        
+        1. **Episode-level ``tasks`` list** (canonical v3.0): the first entry
+           is the natural-language task; we look up its index in the
+           ``meta/tasks*`` vocabulary.
+        2. **Per-frame ``task_index`` column** (as in ``lerobot/libero``):
+           when the episode metadata has no ``tasks`` field, we peek at the
+           first frame's ``task_index`` and reverse-look-up the string via
+           the tasks vocabulary.
+        
+        Returns ``(None, None)`` if neither layout yields task info.
+        """
+        # Layout 1: episode["tasks"] = [task_str, ...]
+        tasks_list = episode.get("tasks") or []
+        if tasks_list:
+            task_string = tasks_list[0]
+            return task_string, self._task_mapping.get(task_string)
+        
+        # Layout 2: derive from per-frame task_index column
+        task_idx = self._episode_first_task_index(episode)
+        if task_idx is None:
+            return None, None
+        return self._tasks_by_index.get(task_idx), task_idx
+    
+    def _episode_first_task_index(self, episode: Dict) -> Optional[int]:
+        """Read the first frame's ``task_index`` for ``episode`` from parquet.
+        
+        Used as a fallback when episode metadata lacks the canonical
+        episode-level ``tasks`` list (some v3.0 datasets, e.g. ``lerobot/libero``,
+        store task assignment only as a per-frame column in the data parquet).
+        
+        Uses the broader ``_data_table_cache`` if it already contains the
+        ``task_index`` column. Otherwise does a tiny one-column projection
+        read cached separately so per-episode lookups stay O(1) after the
+        first hit on a shard. Within-shard offsets come from the trusted
+        ``_episode_location`` map.
+        
+        Returns ``None`` if the parquet shard is missing or has no
+        ``task_index`` column.
+        """
+        shard_key = self._episode_shard_key(episode)
+        from_row, _ = self._episode_row_range(episode)
+        
+        # Path 1: piggyback on the frame-data cache if task_index is in there
+        frame_table = self._data_table_cache.get(shard_key)
+        if frame_table is not None and "task_index" in frame_table.column_names:
+            value = frame_table.column("task_index")[from_row].as_py()
+            return None if value is None else int(value)
+        
+        # Path 2: cheap dedicated projection read, cached per shard
+        task_table = self._task_index_cache.get(shard_key)
+        if task_table is None:
+            parquet_path = self._resolve_data_path(*shard_key)
+            if not parquet_path.exists():
+                return None
+            available = set(pq.read_schema(parquet_path).names)
+            if "task_index" not in available:
+                return None
+            task_table = pq.read_table(parquet_path, columns=["task_index"])
+            self._task_index_cache[shard_key] = task_table
+        
+        if from_row >= task_table.num_rows:
+            return None
+        value = task_table.column("task_index")[from_row].as_py()
+        return None if value is None else int(value)
+    
+    def _extract_frame_columns(self, frame_data) -> Dict[str, List]:
+        """Pull per-frame Python value lists from a PyArrow table once.
+        
+        Robot states / actions are identical across cameras of the same
+        episode, so we extract each column once per episode and reuse the
+        resulting lists for every camera sample in the group.
+        
+        ``to_pylist()`` returns native Python types directly
+        (float32/64 -> float, int64 -> int, bool -> bool, list<T> -> list)
+        with no numpy intermediary.
+        """
+        if frame_data is None:
+            return {}
+        column_names = set(frame_data.column_names)
+        return {
+            fo_name: frame_data.column(fi["lerobot_name"]).to_pylist()
+            for fo_name, fi in self._frame_fields.items()
+            if fi["lerobot_name"] in column_names
+        }
     
     def _create_episode_samples(self, episode: Dict) -> List[Dict]:
-        """Create sample dicts for one episode (all cameras)."""
+        """Build sample dicts for every camera view of one episode."""
         episode_idx = episode["episode_index"]
         group_id = focu.ObjectId()
-        
-        frame_data_df = None
-        if self.include_frame_data:
-            frame_data_df = self._load_episode_frame_data(episode)
-        
-        # Get episode-level metadata
         episode_length = int(episode.get("length", 0))
-        dataset_from_index = episode.get("dataset_from_index")
-        dataset_to_index = episode.get("dataset_to_index")
         
-        # Get task info from episode's tasks list (v3.0 format)
-        tasks_list = episode.get("tasks", [])
-        task_string = tasks_list[0] if tasks_list else None
-        task_index = self._task_mapping.get(task_string) if task_string else None
+        task_string, task_index = self._resolve_episode_task(episode)
         
-        # Get video dimensions from features (same for all cameras of same type)
-        # Default to None, will be populated per-camera if available
+        # Extract per-frame columns ONCE per episode; all cameras share them.
+        frame_columns: Dict[str, List] = {}
+        if self.include_frame_data:
+            frame_columns = self._extract_frame_columns(
+                self._load_episode_frame_data(episode)
+            )
+        
+        common = {
+            "group_id": group_id,
+            "episode_index": episode_idx,
+            "task": task_string,
+            "task_index": task_index,
+            "dataset_from_index": episode.get("dataset_from_index"),
+            "dataset_to_index": episode.get("dataset_to_index"),
+            "frame_columns": frame_columns,
+        }
         
         samples = []
-        
         for camera in self.camera_views:
-            # Get full feature name from mapping
-            # e.g., "top" -> "observation.images.top"
-            video_key = self._video_feature_map.get(camera, camera)
-            
-            # Episode metadata uses format: videos/{video_key}/chunk_index
-            chunk_key = f"videos/{video_key}/chunk_index"
-            file_key = f"videos/{video_key}/file_index"
-            from_key = f"videos/{video_key}/from_timestamp"
-            to_key = f"videos/{video_key}/to_timestamp"
-            
+            chunk_key, file_key, from_key, to_key = self._camera_episode_keys[camera]
             if chunk_key not in episode:
                 continue
             
@@ -726,7 +922,6 @@ class LeRobotDatasetImporter(GroupDatasetImporter):
             to_ts = float(episode[to_key])
             
             source_video = self._resolve_video_path(camera, chunk_idx, file_idx)
-            
             if not source_video.exists():
                 print(f"Warning: Video not found: {source_video}")
                 continue
@@ -739,84 +934,44 @@ class LeRobotDatasetImporter(GroupDatasetImporter):
                     from_timestamp=from_ts,
                     to_timestamp=to_ts,
                 )
-            except Exception as e:
-                print(f"Warning: Failed to extract episode {episode_idx} "
-                      f"camera {camera}: {e}")
+            except (RuntimeError, ValueError, FileNotFoundError) as e:
+                print(
+                    f"Warning: Failed to extract episode {episode_idx} "
+                    f"camera {camera}: {e}"
+                )
                 continue
             
-            # Get video dimensions from features for this camera
-            features = self._dataset_info.get("features", {})
-            camera_feature = features.get(video_key, {})
-            shape = camera_feature.get("shape", [])  # e.g., [480, 640, 3]
-            frame_height = shape[0] if len(shape) > 0 else None
-            frame_width = shape[1] if len(shape) > 1 else None
-            
-            # Calculate duration from timestamps
-            duration = to_ts - from_ts
-            
-            # Build VideoMetadata
+            frame_height, frame_width = self._camera_dimensions[camera]
             video_metadata = fom.VideoMetadata(
                 frame_width=frame_width,
                 frame_height=frame_height,
                 frame_rate=float(self._fps),
                 total_frame_count=episode_length,
-                duration=duration,
+                duration=to_ts - from_ts,
                 mime_type="video/mp4",
-                encoding_str="avc1",  # H.264 (we re-encode to this)
+                encoding_str="avc1",  # output is always H.264, copy or re-encoded
             )
             
-            # Build sample dict
-            sample_dict = {
+            samples.append({
+                **common,
                 "filepath": str(clip_path),
-                "group_id": group_id,
                 "group_name": camera,
-                "metadata": video_metadata,
-                # Episode-level fields
-                "episode_index": episode_idx,
                 "camera_view": camera,
-                # Task info
-                "task": task_string,
-                "task_index": task_index,
-                # Global dataset position
-                "dataset_from_index": dataset_from_index,
-                "dataset_to_index": dataset_to_index,
-                # Frame data for later processing
-                "frame_data": frame_data_df,
-            }
-            
-            samples.append(sample_dict)
+                "metadata": video_metadata,
+            })
         
         return samples
     
-    def _add_frame_data_to_sample(self, sample: fo.Sample, frame_data):
+    def _apply_frame_columns(self, sample: fo.Sample, frame_columns: Dict[str, List]):
+        """Assign pre-extracted per-frame value lists onto a sample's frames.
+        
+        FiftyOne frames are 1-indexed; ``None`` values are left unset so the
+        field stays default rather than being explicitly nulled.
         """
-        Add frame-level data to video sample's frames.
-        
-        Uses the dynamic schema built from info.json features. For each field
-        in _frame_fields, extracts the column from the PyArrow table and assigns
-        values to the corresponding FiftyOne frame.
-        
-        PyArrow's to_pylist() converts directly to native Python types
-        (float, int, bool, list) with no numpy intermediary, so no
-        additional type conversion is needed.
-        """
-        column_names = frame_data.column_names
-        
-        for fo_name, field_info in self._frame_fields.items():
-            lerobot_name = field_info["lerobot_name"]
-            
-            if lerobot_name not in column_names:
-                continue
-            
-            # to_pylist() converts directly to native Python types:
-            # float32/float64 → float, int64 → int, bool → bool,
-            # list<float32> → list[float], nested → nested lists
-            values = frame_data.column(lerobot_name).to_pylist()
-            
-            for i, val in enumerate(values):
-                if val is None:
-                    continue
-                sample.frames[i + 1][fo_name] = val  # FiftyOne frames are 1-indexed
+        for fo_name, values in frame_columns.items():
+            for i, val in enumerate(values, start=1):
+                if val is not None:
+                    sample.frames[i][fo_name] = val
     
     def __len__(self) -> int:
         """Return number of groups (episodes) to import."""
@@ -825,203 +980,216 @@ class LeRobotDatasetImporter(GroupDatasetImporter):
         return len(self._episodes_to_import)
     
     def __iter__(self):
-        """Initialize iteration.
+        """Begin (or restart) lazy iteration over episode groups.
         
-        Only rebuilds the samples iterator if it hasn't been built yet
-        (setup() already builds it on first call).
+        Builds a fresh generator each time so that repeated iteration is
+        well-defined. Extraction and parquet reads happen inside the
+        generator on demand.
         """
-        if self._samples_iter is None:
-            self._build_samples_iterator()
+        self._samples_iter = self._iter_sample_groups()
         return self
     
+    # Optional sample-level fields copied verbatim from sample_dict
+    _OPTIONAL_SAMPLE_FIELDS = ("task", "task_index")
+    _INT_SAMPLE_FIELDS = ("dataset_from_index", "dataset_to_index")
+    
     def __next__(self) -> Dict[str, fo.Sample]:
-        """
-        Return the next group of samples (all camera views for one episode).
+        """Return the next group of samples (one per camera view of one episode).
         
         Returns:
-            Dict mapping slice names to fo.Sample instances
+            Dict mapping slice (camera) name to ``fo.Sample`` instances.
         """
-        # Get all sample dicts for this episode (one per camera)
         sample_dicts = next(self._samples_iter)
+        group_samples: Dict[str, fo.Sample] = {}
         
-        # Build dict mapping slice name -> fo.Sample
-        group_samples = {}
-        
-        for sample_dict in sample_dicts:
-            # Create the FiftyOne sample
-            sample = fo.Sample(filepath=sample_dict["filepath"])
+        for sd in sample_dicts:
+            sample = fo.Sample(filepath=sd["filepath"])
+            sample.metadata = sd["metadata"]
+            sample["episode_index"] = sd["episode_index"]
+            sample["camera_view"] = sd["camera_view"]
             
-            # Set VideoMetadata
-            sample.metadata = sample_dict["metadata"]
+            for key in self._OPTIONAL_SAMPLE_FIELDS:
+                value = sd.get(key)
+                if value is not None:
+                    sample[key] = value
+            for key in self._INT_SAMPLE_FIELDS:
+                value = sd.get(key)
+                if value is not None:
+                    sample[key] = int(value)
             
-            # Episode identification
-            sample["episode_index"] = sample_dict["episode_index"]
-            sample["camera_view"] = sample_dict["camera_view"]
-            
-            # Task info
-            if sample_dict.get("task") is not None:
-                sample["task"] = sample_dict["task"]
-            if sample_dict.get("task_index") is not None:
-                sample["task_index"] = sample_dict["task_index"]
-            
-            # Global dataset position (for mapping back to original dataset)
-            if sample_dict.get("dataset_from_index") is not None:
-                sample["dataset_from_index"] = int(sample_dict["dataset_from_index"])
-            if sample_dict.get("dataset_to_index") is not None:
-                sample["dataset_to_index"] = int(sample_dict["dataset_to_index"])
-            
-            # Add group
             sample[self._group_field] = fog.Group(
-                id=sample_dict["group_id"],
-                name=sample_dict["group_name"]
+                id=sd["group_id"], name=sd["group_name"]
             )
             
-            # Add frame data
-            if sample_dict.get("frame_data") is not None:
-                self._add_frame_data_to_sample(sample, sample_dict["frame_data"])
+            if sd["frame_columns"]:
+                self._apply_frame_columns(sample, sd["frame_columns"])
             
-            group_samples[sample_dict["group_name"]] = sample
+            group_samples[sd["group_name"]] = sample
         
         return group_samples
-    
-    def get_group_field(self) -> str:
-        """Return the group field name."""
-        return self._group_field
     
     def get_group_media_types(self) -> Dict[str, str]:
         """Return media types for each group slice."""
         return {camera: "video" for camera in self.camera_views}
     
     def get_dataset_info(self) -> Dict[str, Any]:
-        """Return dataset info dict with full metadata for ML training and export."""
+        """Return the full LeRobot metadata bundle for ML training and export.
+        
+        This is attached to ``dataset.info`` by FiftyOne's ``add_importer``.
+        Includes the original ``features`` definitions, normalization stats,
+        task vocabulary, and the slice-name -> feature-key mapping needed to
+        round-trip back to the LeRobot layout on export.
+        """
         if self._dataset_info is None:
             return {}
         
         return {
-            # Dataset identification
             "type": "LeRobot v3.0 Dataset",
             "format": "grouped_video",
             "codebase_version": self._dataset_info.get("codebase_version", "v3.0"),
             "robot_type": self._dataset_info.get("robot_type"),
-            
-            # Episode counts
-            "episode_count": len(self._episodes_to_import) if self._episodes_to_import else 0,
+            "episode_count": len(self._episodes_to_import or ()),
             "total_episodes": self._dataset_info.get("total_episodes", 0),
             "total_frames": self._dataset_info.get("total_frames", 0),
-            
-            # Structure
             "camera_views": self.camera_views,
             "default_slice": self.default_slice,
             "group_field": self._group_field,
             "fps": self._fps,
-            
-            # Feature definitions (shapes, dtypes) - source of truth for export
-            # Per-field metadata is also on each field.info for convenience
-            "features": self._dataset_info.get("features", {}),
-            
-            # Normalization statistics - critical for ML training
+            "features": self._features,
             "stats": self._stats,
-            
-            # Task vocabulary
             "tasks": self._task_mapping,
-            
-            # Video feature mapping: camera slice name -> full feature name
-            # e.g., {"hand": "observation.image.hand", ...}
             "video_feature_map": dict(self._video_feature_map),
         }
     
+    # Static descriptions for sample-level fields written by this importer
+    _SAMPLE_FIELD_DESCRIPTIONS: Dict[str, str] = {
+        "episode_index": "Episode number within the dataset",
+        "camera_view": "Camera view / group slice name",
+        "task": "Task description string",
+        "task_index": "Task index in the task vocabulary",
+        "dataset_from_index": "Start row index in the source LeRobot parquet file",
+        "dataset_to_index": "End row index in the source LeRobot parquet file",
+    }
+    
     def apply_field_descriptions(self, dataset: fo.Dataset):
-        """
-        Apply human-readable descriptions and metadata to fields on the dataset.
-        
-        For each frame field, sets:
-        - ``description``: human-readable string from info.json
-          ("description : [name1, name2, ...]")
-        - ``info``: dict with LeRobot metadata for round-trip export
-          (lerobot_name, dtype, shape, names)
-        
-        Also sets descriptions on sample-level fields.
-        
-        Args:
-            dataset: The FiftyOne dataset to annotate
-        """
-        # Frame field descriptions + info from info.json
-        for fo_name, field_info in self._frame_fields.items():
-            try:
-                field = dataset.get_field(f"frames.{fo_name}")
-                if field is None:
-                    continue
-                
-                # Set description if available
-                if fo_name in self._field_descriptions:
-                    field.description = self._field_descriptions[fo_name]
-                
-                # Set info with full LeRobot metadata
-                field.info = {
-                    "lerobot_name": field_info["lerobot_name"],
-                    "dtype": field_info["dtype"],
-                    "shape": field_info["shape"],
-                }
-                if fo_name in self._field_names_meta:
-                    field.info["names"] = self._field_names_meta[fo_name]
-                
-                field.save()
-            except Exception:
-                pass  # Field may not exist if no samples have it
-        
-        # Sample-level field descriptions
-        sample_field_meta = {
-            "episode_index": {
-                "description": "Episode number within the dataset",
-            },
-            "camera_view": {
-                "description": "Camera view / group slice name",
-            },
-            "task": {
-                "description": "Task description string",
-            },
-            "task_index": {
-                "description": "Task index in the task vocabulary",
-            },
-            "dataset_from_index": {
-                "description": "Start row index in the source LeRobot parquet file",
-            },
-            "dataset_to_index": {
-                "description": "End row index in the source LeRobot parquet file",
-            },
-        }
-        for field_name, meta in sample_field_meta.items():
-            try:
-                field = dataset.get_field(field_name)
-                if field is not None:
-                    field.description = meta["description"]
-                    field.save()
-            except Exception:
-                pass
+        """Instance-method shim that calls :func:`apply_lerobot_field_descriptions`."""
+        apply_lerobot_field_descriptions(dataset)
     
     def close(self, *args):
         """Clean up resources."""
         self._data_table_cache.clear()
+        self._task_index_cache.clear()
         self._samples_iter = None
 
 
-class LeRobotDataset(fot.Dataset):
-    """
-    Dataset type for LeRobot v3.0 robotics datasets.
+def apply_lerobot_field_descriptions(dataset: fo.Dataset) -> None:
+    """Attach LeRobot-derived descriptions and metadata to fields on ``dataset``.
     
-    Use with fo.Dataset.from_dir():
-    ```python
-    dataset = fo.Dataset.from_dir(
-        dataset_dir="/path/to/dataset",
-        dataset_type=LeRobotDataset,
-        camera_views=["cam_high", "cam_low"],
-        name="my_dataset",
-    )
-    ```
+    Reads ``dataset.info["features"]`` (populated automatically by
+    :class:`LeRobotDatasetImporter` via ``get_dataset_info``) and applies:
+    
+    - ``field.description`` -- ``"<info.json description> : [n1, n2, ...]"``
+    - ``field.info`` -- ``{"lerobot_name", "dtype", "shape", "names"?}`` so
+      the original LeRobot identity is preserved for round-trip export
+    
+    Static descriptions are also applied to the sample-level fields this
+    importer writes (``episode_index``, ``task``, etc.).
+    
+    Safe to call multiple times. Save failures on individual fields are
+    warned about but not raised, so partial schemas don't abort the
+    annotation pass.
+    
+    This function is normally invoked automatically by
+    :func:`import_lerobot_dataset`. Users of ``fo.Dataset.from_dir()``
+    should call it explicitly after import to attach field metadata::
+    
+        dataset = fo.Dataset.from_dir(
+            dataset_dir="...", dataset_type=LeRobotDataset, name="..."
+        )
+        apply_lerobot_field_descriptions(dataset)
+    """
+    info = dataset.info or {}
+    features = info.get("features", {})
+    if not features:
+        warnings.warn(
+            "dataset.info has no 'features' entry; was this dataset imported "
+            "with LeRobotDataset? Skipping field descriptions."
+        )
+        return
+    
+    # Frame fields (anything in features that isn't a video and isn't a
+    # sample-level skip field). Mirrors _build_frame_field_schema.
+    for lerobot_name, feat_def in features.items():
+        dtype = feat_def.get("dtype", "")
+        if (
+            dtype == "video"
+            or lerobot_name in LeRobotDatasetImporter._SKIP_FRAME_FIELDS
+        ):
+            continue
+        
+        fo_name = lerobot_name.replace(".", "_")
+        field = dataset.get_field(f"frames.{fo_name}")
+        if field is None:
+            # The user may have filtered this field out via include/exclude
+            continue
+        
+        names = feat_def.get("names")
+        description = feat_def.get("description")
+        desc_parts = []
+        if description:
+            desc_parts.append(description)
+        if names:
+            desc_parts.append("[" + ", ".join(names) + "]")
+        if desc_parts:
+            field.description = " : ".join(desc_parts)
+        
+        field.info = {
+            "lerobot_name": lerobot_name,
+            "dtype": dtype,
+            "shape": feat_def.get("shape", []),
+        }
+        if names:
+            field.info["names"] = names
+        
+        try:
+            field.save()
+        except Exception as e:
+            warnings.warn(f"Failed to save metadata for frames.{fo_name}: {e}")
+    
+    # Sample-level field descriptions
+    for field_name, description in (
+        LeRobotDatasetImporter._SAMPLE_FIELD_DESCRIPTIONS.items()
+    ):
+        field = dataset.get_field(field_name)
+        if field is None:
+            continue
+        field.description = description
+        try:
+            field.save()
+        except Exception as e:
+            warnings.warn(f"Failed to save description for {field_name}: {e}")
+
+
+class LeRobotDataset(fot.Dataset):
+    """Dataset type for LeRobot v3.0 robotics datasets.
+    
+    Use with ``fo.Dataset.from_dir()``::
+    
+        dataset = fo.Dataset.from_dir(
+            dataset_dir="/path/to/dataset",
+            dataset_type=LeRobotDataset,
+            camera_views=["cam_high", "cam_low"],
+            name="my_dataset",
+        )
+        # `from_dir` doesn't propagate per-field descriptions automatically;
+        # call this once afterwards to attach them:
+        apply_lerobot_field_descriptions(dataset)
+    
+    Or use :func:`import_lerobot_dataset`, which calls
+    :func:`apply_lerobot_field_descriptions` for you.
     """
     
     def get_dataset_importer_cls(self):
-        """Return the importer class for this dataset type."""
         return LeRobotDatasetImporter
 
 
@@ -1062,20 +1230,19 @@ def import_lerobot_dataset(
         FiftyOne dataset with imported samples
     """
     dataset_dir = Path(dataset_dir)
-    
     if name is None:
         name = dataset_dir.name
     
     if fo.dataset_exists(name):
-        if overwrite:
-            fo.delete_dataset(name)
-        else:
+        if not overwrite:
             raise ValueError(
                 f"Dataset '{name}' already exists. "
                 f"Use overwrite=True to replace it."
             )
+        fo.delete_dataset(name)
     
-    # Build the importer manually so we can call apply_field_descriptions
+    # Drive the importer directly (rather than via from_dir) so we get a
+    # handle on it for the post-import apply_field_descriptions step.
     importer = LeRobotDatasetImporter(
         dataset_dir=str(dataset_dir),
         camera_views=camera_views,
@@ -1090,12 +1257,10 @@ def import_lerobot_dataset(
     
     dataset = fo.Dataset(name)
     dataset.add_importer(importer, dynamic=True)
-    
-    # Apply human-readable descriptions to all fields
-    importer.apply_field_descriptions(dataset)
+    apply_lerobot_field_descriptions(dataset)
     
     return dataset
 
 
-# Register the dataset type with FiftyOne
+# Register the dataset type with FiftyOne so it's discoverable as fot.LeRobotDataset
 fot.LeRobotDataset = LeRobotDataset
