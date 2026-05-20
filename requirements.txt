@@ -1,0 +1,3 @@
+fiftyone>=1.0
+ffmpeg-python>=0.2
+pyarrow>=14
