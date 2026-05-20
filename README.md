@@ -14,7 +14,11 @@ A FiftyOne importer for [LeRobot v3.0](https://huggingface.co/docs/lerobot/lerob
 
 1. **Install dependencies**:
    ```bash
-   pip install fiftyone ffmpeg-python pyarrow tqdm
+   pip install -r requirements.txt
+   ```
+   Or install them directly:
+   ```bash
+   pip install fiftyone ffmpeg-python pyarrow
    ```
 
 2. **Install ffmpeg with AV1 support** (required for video processing):
@@ -64,13 +68,17 @@ dataset_path = snapshot_download(
 
 ```python
 import fiftyone as fo
-from lerobot_importer import LeRobotDataset
+from lerobot_importer import LeRobotDataset, apply_lerobot_field_descriptions
 
 dataset = fo.Dataset.from_dir(
     dataset_dir="my_dataset",
     dataset_type=LeRobotDataset,
     name="my_robot_data",
 )
+
+# Attach LeRobot field descriptions / info to the dataset's schema.
+# (The convenience function `import_lerobot_dataset` does this automatically.)
+apply_lerobot_field_descriptions(dataset)
 
 # Launch FiftyOne App
 session = fo.launch_app(dataset)
